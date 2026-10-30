@@ -1,28 +1,56 @@
-// Умная проверка ответов.
+// Умная проверка ответов (настроена на пару английский ↔ русский).
 // Правила:
 //  - регистр, знаки препинания, лишние пробелы и «ё/е» не важны;
 //  - варианты ответа: «a / b», «a; b», «a | b», короткие списки через запятую;
 //  - слэш внутри фразы: «играть/поиграть в мяч» → оба варианта;
 //  - скобки — необязательная часть: «(по)играть в мяч» → «играть в мяч» и «поиграть в мяч»;
 //  - артикли a/an/the и «to» в начале можно не писать;
-//  - глаголы, отличающиеся только приставкой «по-», считаются одинаковыми;
+//  - сокращения равны полной форме: don't = do not, I'm = I am;
+//  - британское и американское написание равны: colour = color, realise = realize, centre = center;
+//  - пометки sb/sth/smb, кого-л./что-л. можно не писать;
+//  - глаголы, отличающиеся только приставкой вида (играть/поиграть, делать/сделать, писать/написать), равны;
 //  - прощаются мелкие опечатки и другой порядок слов.
 const Check = (() => {
   const ARTICLES = new Set(['a', 'an', 'the']);
-  const ASPECT_PREFIXES = ['по'];
+  const ASPECT_PREFIXES = ['по', 'с', 'на'];
+  const isVerb = (w) => /(ть|ться|ти|тись|чь|чься)$/.test(w);
+
+  const CONTRACTIONS = [
+    [/\bcan't\b/g, 'can not'], [/\bcannot\b/g, 'can not'], [/\bwon't\b/g, 'will not'], [/\bshan't\b/g, 'shall not'],
+    [/\bain't\b/g, 'am not'], [/n't\b/g, ' not'], [/'re\b/g, ' are'], [/'ve\b/g, ' have'], [/'ll\b/g, ' will'],
+    [/'d\b/g, ' would'], [/\bi'm\b/g, 'i am'], [/\blet's\b/g, 'let us'],
+    [/\b(it|he|she|that|there|what|who|where|here|how)'s\b/g, '$1 is'],
+  ];
+  const PLACEHOLDERS_EN = /\b(sb|sth|smb|smth|smbd|someone|somebody|something|one's|oneself|sb's|smb's)\b\.?/g;
+  const PLACEHOLDERS_RU = /(?<!\p{L})(кто|кого|что|кому|чему|кем|чем|ком|чём|чего|чей|чья|чье|чьё|чьи|где|куда|какой)[\s-]?(л|либо|нибудь|то)(?!\p{L})\.?/gu;
 
   function norm(s) {
-    return String(s ?? '')
-      .toLowerCase()
-      .replace(/ё/g, 'е')
-      .replace(/['’‘`´ʼ]/g, '')
+    let t = String(s ?? '').toLowerCase().replace(/ё/g, 'е').replace(/[’‘`´ʼ]/g, "'");
+    t = t.replace(PLACEHOLDERS_EN, ' ').replace(PLACEHOLDERS_RU, ' ');
+    for (const [re, rep] of CONTRACTIONS) t = t.replace(re, rep);
+    return t
+      .replace(/'/g, '')
       .replace(/[^\p{L}\p{N}\s]/gu, ' ')
       .replace(/\s+/g, ' ')
       .trim();
   }
 
+  // Британское → американское написание
+  function spelling(w) {
+    if (!/^[a-z]+$/.test(w) || w.length < 5) return w;
+    if (w.length >= 6) {
+      w = w.replace(/our(s|ed|ing|ite|ites|able|ful)?$/, 'or$1');
+      w = w.replace(/([^aeiou])is(e|es|ed|ing|ation|ations)$/, '$1iz$2');
+      w = w.replace(/ys(e|es|ed|ing)$/, 'yz$1');
+    }
+    w = w.replace(/([^aeiou])tre(s)?$/, '$1ter$2');
+    w = w.replace(/([aeiou])ll(ed|ing|er|ers)$/, '$1l$2');
+    w = w.replace(/ogue$/, 'og');
+    return w;
+  }
+
   function words(s) {
-    let w = norm(s).split(' ').filter(Boolean);
+    let w = norm(s).split(' ').filter(Boolean).map(spelling);
     const noArticles = w.filter((x) => !ARTICLES.has(x));
     if (noArticles.length) w = noArticles;
     if (w[0] === 'to' && w.length > 1) w = w.slice(1);
@@ -70,11 +98,15 @@ const Check = (() => {
     return [...out];
   }
 
-  // 0 — одинаковые, 1 — отличаются приставкой «по-», -1 — разные
+  // 0 — одинаковые, 1 — отличаются приставкой вида, -1 — разные
   function sameWord(a, b) {
     if (a === b) return 0;
-    for (const p of ASPECT_PREFIXES) {
-      if ((a === p + b && b.length >= 3) || (b === p + a && a.length >= 3)) return 1;
+    for (const [x, y] of [[a, b], [b, a]]) {
+      if (!isVerb(y) || y.length < 4) continue;
+      for (const p of ASPECT_PREFIXES) {
+        if (x === p + y) return 1;
+        if (p === 'с' && y[0] === 'и' && x === 'сы' + y.slice(1)) return 1; // играть → сыграть
+      }
     }
     return -1;
   }
@@ -95,7 +127,7 @@ const Check = (() => {
     return prev[n];
   }
 
-  const allowedTypos = (len) => (len <= 3 ? 0 : len <= 9 ? 1 : 2);
+  const allowedTypos = (len) => (len <= 4 ? 0 : len <= 9 ? 1 : 2);
 
   function checkAnswer(answer, expected) {
     const ans = words(answer);
@@ -115,7 +147,7 @@ const Check = (() => {
         if (r < 0) { ok = false; break; }
         if (r > 0) aspect = true;
       }
-      if (ok && aspect) return { ok: true, kind: 'aspect', note: 'Засчитано: отличается только приставкой «по-»' };
+      if (ok && aspect) return { ok: true, kind: 'aspect', note: 'Засчитано: другой вид глагола (как играть / поиграть)' };
     }
 
     const sorted = (s) => s.split(' ').sort().join(' ');

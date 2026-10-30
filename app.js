@@ -74,13 +74,23 @@ function qa(card) {
   return d === 'term' ? { q: card.term, a: card.def, side: 'term' } : { q: card.def, a: card.term, side: 'def' };
 }
 
+function pickVoice(lang) {
+  const voices = speechSynthesis.getVoices().filter((v) => v.lang.replace('_', '-').startsWith(lang));
+  const rank = (v) => (/premium|enhanced|улучш/i.test(v.name) ? 4 : 0) + (/samantha|daniel|karen|serena|milena|google/i.test(v.name) ? 2 : 0) + (v.localService ? 1 : 0);
+  return voices.sort((a, b) => rank(b) - rank(a))[0] || null;
+}
 function speak(text) {
   if (!('speechSynthesis' in window)) return toast('Озвучка не поддерживается');
   speechSynthesis.cancel();
-  const u = new SpeechSynthesisUtterance(text);
-  u.lang = /[а-яё]/i.test(text) ? 'ru-RU' : 'en-US';
+  const ru = /[а-яё]/i.test(text);
+  const u = new SpeechSynthesisUtterance(text.replace(/[()]/g, ''));
+  u.lang = ru ? 'ru-RU' : 'en-US';
+  const v = pickVoice(ru ? 'ru' : 'en');
+  if (v) u.voice = v;
+  u.rate = ru ? 1 : 0.9;
   speechSynthesis.speak(u);
 }
+if ('speechSynthesis' in window) speechSynthesis.getVoices();
 
 /* ---------- Gemini ---------- */
 const AI = {
@@ -159,12 +169,12 @@ const AI = {
   },
 
   async judge({ question, expected, answer, card }) {
-    const prompt = `Ты проверяешь ответ ученика в приложении для изучения слов и фраз.
+    const prompt = `Ты проверяешь ответ русскоязычного ученика, который учит английский язык по карточкам.
 ${card ? `Карточка: «${card.term}» — «${card.def}».\n` : ''}Задание: «${question}»
 Правильный ответ по ключу: «${expected}»
 Ответ ученика: «${answer}»
 
-Засчитай ответ (correct: true), если он передаёт тот же смысл и грамматически допустим: синонимы, другой вид глагола (играть / поиграть), другой порядок слов, пропущенные артикли, мелкие опечатки — это нормально.
+Засчитай ответ (correct: true), если он передаёт тот же смысл и грамматически допустим: синонимы, другой вид глагола (играть / поиграть), другой порядок слов, британское или американское написание и лексика, сокращения (don't / do not), пропущенные артикли, мелкие опечатки — это нормально. Если в английском ответе есть грамматическая ошибка, которая не мешает смыслу (например, время или артикль), засчитай, но коротко укажи на неё в комментарии.
 Не засчитывай (correct: false), если смысл другой, слово переведено неверно или ответ слишком неполный.
 Верни только JSON: {"correct": true или false, "comment": "одно-два коротких предложения по-русски: почему, и как правильно, если есть ошибка"}`;
     const res = await AI.ask(prompt);
@@ -176,15 +186,15 @@ ${card ? `Карточка: «${card.term}» — «${card.def}».\n` : ''}Зад
       .sort((a, b) => (a.streak || 0) - (b.streak || 0) || (b.wrong || 0) - (a.wrong || 0))
       .slice(0, 40);
     const list = cards.map((c) => `- ${c.term} — ${c.def}`).join('\n');
-    const prompt = `Ты составляешь упражнения для ученика, который учит слова по карточкам.
+    const prompt = `Ты составляешь упражнения для русскоязычного ученика, который учит английский язык по карточкам.
 Набор «${set.title}» (термин — значение):
 ${list}
 
-Обычно термин — на изучаемом языке, а значение — на родном языке ученика (чаще всего русском). Определи языки сам.
+Обычно термин — на английском, значение — на русском (если наоборот, разберись сам). Уровень сложности предложений подбери по словам набора: простые слова — простые предложения.
 Составь ${n} разнообразных упражнений, каждое — на одно слово/фразу из набора. В первую очередь используй слова из начала списка (они сложнее для ученика). Чередуй типы:
-- "fill": предложение на изучаемом языке с пропуском "___"; answer — то, что нужно вставить (в нужной грамматической форме); hint — перевод всего предложения на родной язык.
-- "translate": короткое естественное предложение на родном языке, которое нужно перевести на изучаемый, используя слово из набора; answer — эталонный перевод; hint — какое слово из набора нужно использовать.
-- "choice": вопрос на понимание (что означает слово, какое слово подходит по смыслу в предложение и т.п.) с 4 вариантами; options — 4 варианта; answer — точный текст правильного варианта.
+- "fill": предложение на английском с пропуском "___"; answer — английское слово/фраза из набора в нужной грамматической форме (won, played, is playing и т.п.); hint — перевод всего предложения на русский.
+- "translate": короткое естественное предложение на русском, которое нужно перевести на английский, используя слово из набора; answer — эталонный английский перевод; hint — какое слово из набора нужно использовать.
+- "choice": вопрос на понимание с 4 вариантами: что означает английское слово, какое слово подходит в английское предложение, какое предложение звучит естественно и т.п.; options — 4 варианта; answer — точный текст правильного варианта.
 Пиши простые, живые предложения уровня ученика. Поле explanation — одно короткое пояснение по-русски.
 Верни только JSON: {"tasks": [{"type": "fill|translate|choice", "question": "...", "answer": "...", "hint": "...", "options": ["..."], "explanation": "..."}]}`;
     const res = await AI.ask(prompt);
@@ -297,7 +307,7 @@ function viewEdit(existing) {
   const draw = () => {
     app.innerHTML = layout(existing ? 'Редактирование' : 'Новый набор', `
       <label class="field"><span>Название</span><input id="title" value="${esc(draft.title)}" placeholder="Например: Unit 5 — Sport"></label>
-      <p class="hint">Несколько правильных ответов пиши через « / » или «;», необязательную часть — в скобках: <b>(по)играть в мяч</b>.</p>
+      <p class="hint">Несколько правильных ответов пиши через « / » или «;», необязательную часть — в скобках: <b>(по)играть в мяч</b>. Пометки sb/sth и кого-л./что-л. при проверке можно не писать.</p>
       <div id="rows">${draft.cards.map((c, i) => `
         <div class="edit-card"><div class="edit-head"><span class="muted small">${i + 1}</span><button class="icon-btn small" data-del="${i}" aria-label="Удалить">✕</button></div>
         <textarea data-i="${i}" data-f="term" rows="1" placeholder="Термин">${esc(c.term)}</textarea>
@@ -424,7 +434,15 @@ function viewSettings() {
       <div class="stack"><button class="btn" id="backup">Скачать копию (файл)</button>
       <label class="btn">Восстановить из файла<input type="file" id="restore" accept=".json,application/json" class="hidden"></label></div>
     </div>
-    <p class="hint center mt">Совет: в меню браузера выбери «Добавить на главный экран» — приложение будет открываться как обычное.</p>`,
+    <div class="panel mt">
+      <b>📱 Установка на iPhone</b>
+      <ol class="small" style="padding-left:20px;margin:8px 0">
+        <li>Открой эту страницу в <b>Safari</b>.</li>
+        <li>Нажми кнопку «Поделиться» <b>⎋</b> (квадрат со стрелкой вверх).</li>
+        <li>Выбери <b>«На экран „Домой“»</b> → «Добавить».</li>
+      </ol>
+      <p class="hint">Так приложение работает на весь экран и без интернета, а iOS не удаляет его данные. Важно: у иконки на экране «Домой» и у вкладки в Safari <b>разные хранилища</b> — пользуйся чем-то одним (лучше иконкой). Перенести наборы между ними можно через резервную копию.</p>
+    </div>`,
   { back: '#/' });
 
   const st = $('#keyStatus');
@@ -450,11 +468,18 @@ function viewSettings() {
   $('#model').onchange = (e) => { settings.model = e.target.value; saveSettings(); toast('Модель выбрана'); };
   if ($('#removeKey')) $('#removeKey').onclick = () => { settings.apiKey = ''; settings.model = ''; settings.models = []; saveSettings(); route(); };
 
-  $('#backup').onclick = () => {
-    const blob = new Blob([JSON.stringify({ app: 'kartochki', version: 1, sets }, null, 2)], { type: 'application/json' });
+  $('#backup').onclick = async () => {
+    const json = JSON.stringify({ app: 'kartochki', version: 1, sets }, null, 2);
+    const name = `kartochki-${new Date().toISOString().slice(0, 10)}.json`;
+    const file = new File([json], name, { type: 'application/json' });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      try { await navigator.share({ files: [file], title: 'Карточки — резервная копия' }); return; }
+      catch (e) { if (e.name === 'AbortError') return; }
+    }
+    const blob = new Blob([json], { type: 'application/json' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = `kartochki-${new Date().toISOString().slice(0, 10)}.json`;
+    a.download = name;
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 2000);
   };
@@ -787,6 +812,7 @@ function playAI(s) {
 
 /* ---------- start ---------- */
 route();
+if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
 if ('serviceWorker' in navigator && location.protocol === 'https:') {
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }
