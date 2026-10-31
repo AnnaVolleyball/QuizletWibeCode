@@ -60,6 +60,9 @@ function saveSets() {
   if (typeof scheduleSync === 'function') scheduleSync();
 }
 const saveSettings = () => localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+// Ключ Gemini и модель тоже синхронизируются (зашифрованно): aiAt — когда их меняли на этом устройстве
+function saveAI() { settings.aiAt = Date.now(); saveSettings(); if (typeof scheduleSync === 'function') scheduleSync(); }
+if (settings.apiKey && !settings.aiAt) { settings.aiAt = Date.now(); saveSettings(); } // ключ из прежней версии — отправить
 const getSet = (id) => sets.find((s) => s.id === id);
 const getFolder = (id) => folders.find((f) => f.id === id);
 const setFolders = (setId) => folders.filter((f) => f.setIds.includes(setId));
@@ -174,6 +177,7 @@ async function syncBuild(k, since) {
   for (const s of sets) if ((s.syncAt || 0) > since) out.push(await syncSeal(k, await syncRid(k, 'set', s.id), s.syncAt, { s }));
   for (const f of folders) if ((f.syncAt || 0) > since) out.push(await syncSeal(k, await syncRid(k, 'folder', f.id), f.syncAt, { f }));
   for (const d of deleted) if (d.at > since) out.push(await syncSeal(k, await syncRid(k, delKind(d), d.id), d.at, { d: { ...d, k: delKind(d) } }));
+  if ((settings.aiAt || 0) > since) out.push(await syncSeal(k, await syncRid(k, 'ai', ''), settings.aiAt, { g: { apiKey: settings.apiKey, model: settings.model, models: settings.models || [], at: settings.aiAt } }));
   return out;
 }
 async function syncUnpack(k, items) {
@@ -184,6 +188,7 @@ async function syncUnpack(k, items) {
     if (p.s && p.s.id && Array.isArray(p.s.cards)) ch.sets.push(p.s);
     else if (p.f && p.f.id && Array.isArray(p.f.setIds)) ch.folders.push(p.f);
     else if (p.d && p.d.id) ch.deleted.push(p.d);
+    else if (p.g && typeof p.g.apiKey === 'string') ch.ai = p.g;
   }
   return ch;
 }
@@ -211,6 +216,10 @@ function applyRemote(ch) {
     if (!deleted.some((x) => delKind(x) === k && x.id === d.id)) deleted.push({ ...d, k });
   }
   if (n) persistSets();
+  if (ch.ai && (ch.ai.at || 0) > (settings.aiAt || 0)) {
+    Object.assign(settings, { apiKey: ch.ai.apiKey, model: ch.ai.model || '', models: ch.ai.models || [], aiAt: ch.ai.at });
+    saveSettings(); n++;
+  }
   return n;
 }
 
@@ -410,7 +419,7 @@ const AI = {
     if (!list.length) throw new Error('Для этого ключа не нашлось подходящих моделей Gemini.');
     settings.models = list;
     settings.model = list[0];
-    saveSettings();
+    saveAI();
     return settings.model;
   },
 
@@ -818,7 +827,7 @@ function viewSettings() {
       <div class="row mt"><button class="btn primary" id="saveKey">Сохранить и проверить</button><button class="btn" id="showKey">👁</button></div>
       <div id="keyStatus" class="small mt muted">${settings.apiKey ? 'Ключ сохранён.' : 'Ключ не добавлен — ИИ-функции выключены.'}</div>
       <label class="field"><span>Модель</span><select id="model">${modelOptions()}</select></label>
-      <p class="hint">Ключ хранится только в этом браузере на твоём телефоне и отправляется только в Google. На бесплатном тарифе есть лимит запросов в день, а Google может использовать запросы для улучшения своих моделей — не пиши в карточки ничего личного.</p>
+      <p class="hint">Ключ хранится на этом устройстве и отправляется только в Google. Если включена синхронизация, он в зашифрованном виде попадёт и на другие твои устройства. На бесплатном тарифе есть лимит запросов в день, а Google может использовать запросы для улучшения своих моделей — не пиши в карточки ничего личного.</p>
       ${settings.apiKey ? '<button class="link" id="removeKey">Удалить ключ</button>' : ''}
     </div>
     <div class="panel mt" id="syncPanel">${syncPanelHTML()}</div>
@@ -853,15 +862,15 @@ function viewSettings() {
       settings.apiKey = key;
       settings.models = list;
       if (!list.includes(settings.model)) settings.model = list[0];
-      saveSettings();
+      saveAI();
       $('#model').innerHTML = modelOptions();
       st.innerHTML = `<span style="color:var(--good)">✓ Ключ работает. Модель: ${esc(settings.model)}</span>`;
     } catch (e) {
       st.innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>`;
     } finally { $('#saveKey').disabled = false; }
   };
-  $('#model').onchange = (e) => { settings.model = e.target.value; saveSettings(); toast('Модель выбрана'); };
-  if ($('#removeKey')) $('#removeKey').onclick = () => { settings.apiKey = ''; settings.model = ''; settings.models = []; saveSettings(); route(); };
+  $('#model').onchange = (e) => { settings.model = e.target.value; saveAI(); toast('Модель выбрана'); };
+  if ($('#removeKey')) $('#removeKey').onclick = () => { settings.apiKey = ''; settings.model = ''; settings.models = []; saveAI(); route(); };
 
   $('#backup').onclick = async () => {
     const json = JSON.stringify({ app: 'kartochki', version: 2, sets, folders }, null, 2);

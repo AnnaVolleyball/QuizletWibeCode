@@ -1,5 +1,5 @@
 // Офлайн-режим: сначала сеть, при её отсутствии — сохранённая копия.
-const CACHE = 'kartochki-v4';
+const CACHE = 'kartochki-v5';
 const ASSETS = ['./', './index.html', './style.css', './app.js', './check.js', './manifest.json', './icon.svg', './icon-192.png'];
 
 self.addEventListener('install', (e) => {
