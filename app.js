@@ -336,6 +336,8 @@ setInterval(() => { if (document.visibilityState === 'visible') scheduleSync(0);
 
 const status = (c) => ((c.streak || 0) >= 2 ? 'known' : (c.right || c.wrong) ? 'learning' : 'new');
 const knownCount = (s) => s.cards.filter((c) => status(c) === 'known').length;
+// «выучено 3 · учу 5»: «учу» — слова, на которые уже отвечали, но ещё не 2 раза подряд верно
+const progressText = (s) => { const l = s.cards.filter((c) => status(c) === 'learning').length; return `выучено ${knownCount(s)}` + (l ? ` · учу ${l}` : ''); };
 
 function mark(set, card, ok) {
   const c = findCard(card.id);
@@ -541,11 +543,11 @@ let lastFolder = null; // из какой папки пришли — туда �
 /* ---------- home ---------- */
 const setItem = (s) => {
   const k = knownCount(s);
-  return `<a class="set-item" href="#/set/${s.id}"><div class="set-title">${esc(s.title)}</div><div class="muted small">${cardsWord(s.cards.length)} · выучено ${k}</div>${bar(s.cards.length ? (k / s.cards.length) * 100 : 0)}</a>`;
+  return `<a class="set-item" href="#/set/${s.id}"><div class="set-title">${esc(s.title)}</div><div class="muted small">${cardsWord(s.cards.length)} · ${progressText(s)}</div>${bar(s.cards.length ? (k / s.cards.length) * 100 : 0)}</a>`;
 };
 const folderItem = (f) => {
   const d = folderDeck(f), k = knownCount(d), n = f.setIds.filter(getSet).length;
-  return `<a class="set-item folder-item" href="#/folder/${f.id}"><div class="set-title">📁 ${esc(f.title)}</div><div class="muted small">${n} ${plural(n, 'набор', 'набора', 'наборов')} · ${cardsWord(d.cards.length)} · выучено ${k}</div>${bar(d.cards.length ? (k / d.cards.length) * 100 : 0)}</a>`;
+  return `<a class="set-item folder-item" href="#/folder/${f.id}"><div class="set-title">📁 ${esc(f.title)}</div><div class="muted small">${n} ${plural(n, 'набор', 'набора', 'наборов')} · ${cardsWord(d.cards.length)} · ${progressText(d)}</div>${bar(d.cards.length ? (k / d.cards.length) * 100 : 0)}</a>`;
 };
 const byUpdated = (a, b) => (b.updated || 0) - (a.updated || 0);
 const byTitle = (a, b) => a.title.localeCompare(b.title, 'ru');
@@ -596,7 +598,7 @@ function viewFolder(f) {
   const d = folderDeck(f), k = knownCount(d);
   const list = f.setIds.map(getSet).filter(Boolean);
   app.innerHTML = layout('📁 ' + f.title, `
-    <div class="muted small">${list.length} ${plural(list.length, 'набор', 'набора', 'наборов')} · ${cardsWord(d.cards.length)} · выучено ${k}</div>
+    <div class="muted small">${list.length} ${plural(list.length, 'набор', 'набора', 'наборов')} · ${cardsWord(d.cards.length)} · ${progressText(d)}</div>
     ${bar(d.cards.length ? (k / d.cards.length) * 100 : 0)}
     ${d.cards.length ? modesHTML(`#/folder/${f.id}`, 'по всем словам папки') : ''}
     <h2 class="section">Наборы в папке</h2>
@@ -668,7 +670,7 @@ function viewSet(s) {
   const fs = setFolders(s.id);
   const back = lastFolder && getFolder(lastFolder)?.setIds.includes(s.id) ? `#/folder/${lastFolder}` : '#/';
   app.innerHTML = layout(s.title, `
-    <div class="muted small">${cardsWord(s.cards.length)} · выучено ${k}</div>
+    <div class="muted small">${cardsWord(s.cards.length)} · ${progressText(s)}</div>
     ${bar(s.cards.length ? (k / s.cards.length) * 100 : 0)}
     <a class="folder-line small" href="#/set/${s.id}/folders">📁 ${fs.length ? fs.map((f) => esc(f.title)).join(', ') : 'Положить в папку'}</a>
     ${modesHTML(`#/set/${s.id}`, 'именно под этот набор')}
