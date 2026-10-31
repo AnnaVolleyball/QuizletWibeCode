@@ -4,10 +4,9 @@
 сервер — `server/` (подробности установки — `server/README.md`).
 
 ## Статус
-- 31.10.2026: код готов и проверен локально (два «устройства», добавление, прогресс, удаление).
-  Служба `kartochki-sync` запущена на сервере Анны (только на 127.0.0.1).
-- Ждёт DNS: `kartochki-sync.lav11.com` (A-запись на сервер) и `kartochki.lav11.com` (CNAME на GitHub Pages).
-  После этого: блок в Caddyfile, файл `CNAME` в репозитории, Custom domain в настройках Pages.
+**Работает** (с 31.10.2026): приложение — **https://kartochki.lav11.com**, сервер синхронизации —
+**https://kartochki-sync.lav11.com** (Caddy → служба `kartochki-sync`).
+DNS в Cloudflare (режим «DNS only»): `kartochki-sync` — A-запись на сервер, `kartochki` — CNAME на GitHub Pages.
 
 ## Как устроено
 - Данные по-прежнему хранятся на устройстве (`localStorage`): приложение работает без интернета.
