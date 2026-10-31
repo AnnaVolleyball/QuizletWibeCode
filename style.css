@@ -1,28 +1,30 @@
 :root {
-  --bg: #f4f5fb;
+  --bg: #eef6fc;
   --card: #ffffff;
-  --text: #1c1d29;
-  --muted: #6b6f86;
-  --line: #e3e5f0;
-  --accent: #4f46e5;
-  --accent-soft: #eceafe;
+  --text: #0f2536;
+  --muted: #5b7488;
+  --line: #d5e6f3;
+  --accent: #0284c7;
+  --accent-soft: #e0f2fe;
+  --on-accent: #ffffff;
   --good: #16a34a;
   --good-soft: #dcfce7;
   --bad: #dc2626;
   --bad-soft: #fee2e2;
   --warn-soft: #fef3c7;
-  --shadow: 0 2px 10px rgba(20, 20, 60, .07);
+  --shadow: 0 2px 10px rgba(10, 60, 100, .08);
   --radius: 16px;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #111220;
-    --card: #1c1d2e;
-    --text: #ecedf7;
-    --muted: #9a9db6;
-    --line: #2d2f45;
-    --accent: #8b85ff;
-    --accent-soft: #29285a;
+    --bg: #0b1724;
+    --card: #132332;
+    --text: #e6f2fa;
+    --muted: #8ea8bb;
+    --line: #21394d;
+    --accent: #38bdf8;
+    --accent-soft: #0c3550;
+    --on-accent: #04263a;
     --good: #4ade80;
     --good-soft: #143a24;
     --bad: #f87171;
@@ -72,7 +74,7 @@ main { max-width: 640px; margin: 0 auto; padding: 4px 16px 32px; }
 }
 .btn:active { transform: scale(.98); }
 .btn:disabled { opacity: .55; }
-.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 .btn.good { background: var(--good-soft); border-color: transparent; color: var(--good); }
 .btn.bad { background: var(--bad-soft); border-color: transparent; color: var(--bad); }
 .btn.wide { width: 100%; }
@@ -211,3 +213,9 @@ details.howto ol { margin: 8px 0 0; padding-left: 20px; }
 }
 #toast.show { opacity: 1; transform: translateX(-50%); }
 .sync-key { font-family: ui-monospace, Menlo, monospace; font-size: 17px; letter-spacing: 1px; text-align: center; padding: 12px; margin-top: 10px; border-radius: 12px; background: var(--accent-soft); word-break: break-all; user-select: all; -webkit-user-select: all; }
+h2.section { font-size: 15px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; margin: 22px 4px 8px; }
+.folder-item .set-title { font-weight: 700; }
+.folder-line { display: block; margin: 10px 0 2px; color: var(--accent); font-weight: 600; }
+label.check { display: flex; gap: 12px; align-items: center; padding: 10px 2px; border-bottom: 1px solid var(--line); cursor: pointer; }
+label.check:last-child { border-bottom: 0; }
+label.check input { width: 22px; height: 22px; accent-color: var(--accent); flex: none; margin: 0; }

@@ -25,35 +25,51 @@ const SETS_KEY = 'qv.sets', SETTINGS_KEY = 'qv.settings';
 function load(key, fallback) { try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; } }
 let sets = load(SETS_KEY, null);
 let settings = Object.assign({ apiKey: '', model: '', direction: 'term', models: [] }, load(SETTINGS_KEY, {}));
-const DEL_KEY = 'qv.deleted'; // удалённые наборы [{ id, at }] — чтобы удаление дошло до других устройств
-let deleted = load(DEL_KEY, []);
-// Для синхронизации: у каждого набора есть syncAt — когда он менялся. saveSets() сам находит изменённые
-// наборы (сравнивает с прошлым снимком) и ставит им syncAt, а исчезнувшие заносит в deleted.
+const FOLDERS_KEY = 'qv.folders', DEL_KEY = 'qv.deleted';
+let folders = load(FOLDERS_KEY, []); // [{ id, title, setIds: [], created, syncAt }]
+let deleted = load(DEL_KEY, []); // удалённые наборы и папки [{ k: 'set'|'folder', id, at }] — чтобы удаление дошло до других устройств
+// Для синхронизации: у каждого набора и папки есть syncAt — когда они менялись. saveSets() сам находит изменённые
+// (сравнивает с прошлым снимком) и ставит им syncAt, а исчезнувшие заносит в deleted.
+const COLLS = { set: () => sets, folder: () => folders };
+const delKind = (d) => d.k || 'set';
 const setHash = (s) => { const { syncAt, ...rest } = s; return JSON.stringify(rest); };
-let setHashes = new Map();
+let setHashes = new Map(); // 'set:<id>' / 'folder:<id>' → снимок
 function persistSets() {
   localStorage.setItem(SETS_KEY, JSON.stringify(sets));
+  localStorage.setItem(FOLDERS_KEY, JSON.stringify(folders));
   localStorage.setItem(DEL_KEY, JSON.stringify(deleted));
 }
 function saveSets() {
   const t = Date.now(), seen = new Set();
-  for (const s of sets) {
-    seen.add(s.id);
-    const h = setHash(s);
-    if (setHashes.get(s.id) !== h || !s.syncAt) { s.syncAt = t; setHashes.set(s.id, h); }
+  for (const [k, list] of Object.entries(COLLS)) {
+    for (const o of list()) {
+      const key = k + ':' + o.id, h = setHash(o);
+      seen.add(key);
+      if (setHashes.get(key) !== h || !o.syncAt) { o.syncAt = t; setHashes.set(key, h); }
+    }
   }
-  for (const id of [...setHashes.keys()]) {
-    if (seen.has(id)) continue;
-    setHashes.delete(id);
-    deleted = deleted.filter((d) => d.id !== id);
-    deleted.push({ id, at: t });
+  for (const key of [...setHashes.keys()]) {
+    if (seen.has(key)) continue;
+    setHashes.delete(key);
+    const i = key.indexOf(':'), k = key.slice(0, i), id = key.slice(i + 1);
+    deleted = deleted.filter((d) => !(delKind(d) === k && d.id === id));
+    deleted.push({ k, id, at: t });
   }
-  deleted = deleted.filter((d) => !seen.has(d.id));
+  deleted = deleted.filter((d) => !seen.has(delKind(d) + ':' + d.id));
   persistSets();
   if (typeof scheduleSync === 'function') scheduleSync();
 }
 const saveSettings = () => localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
 const getSet = (id) => sets.find((s) => s.id === id);
+const getFolder = (id) => folders.find((f) => f.id === id);
+const setFolders = (setId) => folders.filter((f) => f.setIds.includes(setId));
+function findCard(id) { for (const s of sets) { const c = s.cards.find((x) => x.id === id); if (c) return c; } return null; }
+// Папка как один большой набор: все карточки её наборов (те же объекты карточек)
+function folderDeck(f) {
+  const ss = f.setIds.map(getSet).filter(Boolean);
+  return { id: f.id, isFolder: true, title: f.title, cards: ss.flatMap((x) => x.cards), bestMatch: f.bestMatch };
+}
+const home = (s) => (s.isFolder ? `#/folder/${s.id}` : `#/set/${s.id}`);
 const newCard = (term = '', def = '') => ({ id: uid(), term, def, streak: 0, right: 0, wrong: 0 });
 
 if (!Array.isArray(sets)) {
@@ -72,7 +88,7 @@ if (!Array.isArray(sets)) {
   }];
   saveSets();
 }
-for (const s of sets) { if (!s.syncAt) s.syncAt = s.updated || s.created || 1; setHashes.set(s.id, setHash(s)); }
+for (const [k, list] of Object.entries(COLLS)) for (const o of list()) { if (!o.syncAt) o.syncAt = o.updated || o.created || 1; setHashes.set(k + ':' + o.id, setHash(o)); }
 
 /* ---------- синхронизация через свой сервер ----------
    Наборы хранятся на устройстве, а на сервер уходит их зашифрованная копия (по образцу «Монетки»).
@@ -140,7 +156,7 @@ async function syncKeys(key) {
   sync.keysFor = key;
   return sync.keys;
 }
-const syncRid = async (k, id) => hex(await crypto.subtle.sign('HMAC', k.mac, new TextEncoder().encode('set\n' + id))).slice(0, 32);
+const syncRid = async (k, kind, id) => hex(await crypto.subtle.sign('HMAC', k.mac, new TextEncoder().encode(kind + '\n' + id))).slice(0, 32);
 async function syncSeal(k, rid, ts, payload) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: new TextEncoder().encode(rid + ':' + ts) }, k.enc, new TextEncoder().encode(JSON.stringify(payload)));
@@ -155,16 +171,18 @@ async function syncOpen(k, it) {
 // Что изменилось на устройстве после since → зашифрованные записи
 async function syncBuild(k, since) {
   const out = [];
-  for (const s of sets) if ((s.syncAt || 0) > since) out.push(await syncSeal(k, await syncRid(k, s.id), s.syncAt, { s }));
-  for (const d of deleted) if (d.at > since) out.push(await syncSeal(k, await syncRid(k, d.id), d.at, { d }));
+  for (const s of sets) if ((s.syncAt || 0) > since) out.push(await syncSeal(k, await syncRid(k, 'set', s.id), s.syncAt, { s }));
+  for (const f of folders) if ((f.syncAt || 0) > since) out.push(await syncSeal(k, await syncRid(k, 'folder', f.id), f.syncAt, { f }));
+  for (const d of deleted) if (d.at > since) out.push(await syncSeal(k, await syncRid(k, delKind(d), d.id), d.at, { d: { ...d, k: delKind(d) } }));
   return out;
 }
 async function syncUnpack(k, items) {
-  const ch = { sets: [], deleted: [] };
+  const ch = { sets: [], folders: [], deleted: [] };
   for (const it of items) {
     let p;
     try { p = await syncOpen(k, it); } catch { console.warn('sync: запись не расшифровалась', it.rid); continue; }
     if (p.s && p.s.id && Array.isArray(p.s.cards)) ch.sets.push(p.s);
+    else if (p.f && p.f.id && Array.isArray(p.f.setIds)) ch.folders.push(p.f);
     else if (p.d && p.d.id) ch.deleted.push(p.d);
   }
   return ch;
@@ -172,20 +190,25 @@ async function syncUnpack(k, items) {
 // Принять изменения с других устройств: побеждает более позднее
 function applyRemote(ch) {
   let n = 0;
-  for (const r of ch.sets) {
-    const tomb = deleted.find((d) => d.id === r.id);
-    if (tomb && tomb.at >= (r.syncAt || 0)) continue;
-    const i = sets.findIndex((s) => s.id === r.id);
-    if (i < 0) { if (tomb) deleted = deleted.filter((d) => d !== tomb); sets.push(r); }
-    else if ((r.syncAt || 0) > (sets[i].syncAt || 0)) sets[i] = r;
-    else continue;
-    setHashes.set(r.id, setHash(r)); n++;
+  for (const [k, incoming] of [['set', ch.sets || []], ['folder', ch.folders || []]]) {
+    for (const r of incoming) {
+      const list = COLLS[k]();
+      const tomb = deleted.find((d) => delKind(d) === k && d.id === r.id);
+      if (tomb && tomb.at >= (r.syncAt || 0)) continue;
+      const i = list.findIndex((x) => x.id === r.id);
+      if (i < 0) { if (tomb) deleted = deleted.filter((d) => d !== tomb); list.push(r); }
+      else if ((r.syncAt || 0) > (list[i].syncAt || 0)) list[i] = r;
+      else continue;
+      setHashes.set(k + ':' + r.id, setHash(r)); n++;
+    }
   }
-  for (const d of ch.deleted) {
-    const i = sets.findIndex((s) => s.id === d.id);
-    if (i >= 0 && (sets[i].syncAt || 0) > d.at) continue; // здесь набор правили позже удаления
-    if (i >= 0) { sets.splice(i, 1); setHashes.delete(d.id); n++; }
-    if (!deleted.some((x) => x.id === d.id)) deleted.push(d);
+  for (const d of ch.deleted || []) {
+    const k = delKind(d);
+    if (!COLLS[k]) continue;
+    const list = COLLS[k](), i = list.findIndex((x) => x.id === d.id);
+    if (i >= 0 && (list[i].syncAt || 0) > d.at) continue; // здесь правили позже удаления
+    if (i >= 0) { list.splice(i, 1); setHashes.delete(k + ':' + d.id); n++; }
+    if (!deleted.some((x) => delKind(x) === k && x.id === d.id)) deleted.push({ ...d, k });
   }
   if (n) persistSets();
   return n;
@@ -253,7 +276,7 @@ async function syncNow(manual) {
   sync.busy = false;
   // во время игры экран не перерисовываем, чтобы не сбить упражнение
   const h = location.hash.replace(/^#\/?/, '');
-  if (changed && (h === '' || /^set\/[^/]+$/.test(h))) route();
+  if (changed && (h === '' || h === 'all' || /^(set|folder)\/[^/]+$/.test(h))) route();
   else syncRefreshUI();
   if (sync.again) { sync.again = false; scheduleSync(1000); }
 }
@@ -270,9 +293,9 @@ async function syncConnect(server, key, isNew) {
   const got = await syncPullAll(cfg, k); // заодно проверяет адрес и ключ
   if (!isNew && got.items.length) {
     const own = sets.filter((s) => !(s.demo || (s.title === 'Пример: спорт' && s.cards.length === 8)));
-    const replace = !own.length || confirm('На сервере уже есть наборы.\n\nОК — заменить наборы этого устройства наборами с сервера (рекомендуется).\nОтмена — объединить: на сервер уйдут и наборы этого устройства.');
+    const replace = (!own.length && !folders.length) || confirm('На сервере уже есть наборы.\n\nОК — заменить наборы этого устройства наборами с сервера (рекомендуется).\nОтмена — объединить: на сервер уйдут и наборы этого устройства.');
     if (replace) {
-      sets = []; deleted = []; setHashes = new Map();
+      sets = []; folders = []; deleted = []; setHashes = new Map();
       applyRemote(await syncUnpack(k, got.items));
       persistSets();
       cfg.pushedAt = Date.now(); cfg.cursor = got.cursor;
@@ -306,7 +329,7 @@ const status = (c) => ((c.streak || 0) >= 2 ? 'known' : (c.right || c.wrong) ? '
 const knownCount = (s) => s.cards.filter((c) => status(c) === 'known').length;
 
 function mark(set, card, ok) {
-  const c = (getSet(set.id) || set).cards.find((x) => x.id === card.id);
+  const c = findCard(card.id);
   if (!c) return;
   c.prevStreak = c.streak || 0;
   if (ok) { c.right = (c.right || 0) + 1; c.streak = (c.streak || 0) + 1; }
@@ -314,7 +337,7 @@ function mark(set, card, ok) {
   saveSets();
 }
 function unmarkWrong(set, card) {
-  const c = (getSet(set.id) || set).cards.find((x) => x.id === card.id);
+  const c = findCard(card.id);
   if (!c) return;
   c.wrong = Math.max(0, (c.wrong || 0) - 1);
   c.right = (c.right || 0) + 1;
@@ -482,65 +505,172 @@ function route() {
   if (p[0] === 'new') return viewEdit(null);
   if (p[0] === 'import') return viewImport(null);
   if (p[0] === 'settings') return viewSettings();
+  if (p[0] === 'all') return viewAllSets();
+  if (p[0] === 'newfolder') return viewFolderEdit(null);
+  if (p[0] === 'folder' && p[1]) {
+    const f = getFolder(p[1]);
+    if (!f) return go('#/');
+    if (p[2] === 'edit') return viewFolderEdit(f);
+    if (p[2] === 'play' && MODES[p[3]]) return MODES[p[3]](folderDeck(f));
+    return viewFolder(f);
+  }
   if (p[0] === 'set' && p[1]) {
     const s = getSet(p[1]);
     if (!s) return go('#/');
     if (p[2] === 'edit') return viewEdit(s);
     if (p[2] === 'import') return viewImport(s);
-    if (p[2] === 'play') {
-      const modes = { flash: playFlash, write: playWrite, test: playTest, match: playMatch, ai: playAI };
-      if (modes[p[3]]) return modes[p[3]](s);
-    }
+    if (p[2] === 'folders') return viewSetFolders(s);
+    if (p[2] === 'play' && MODES[p[3]]) return MODES[p[3]](s);
     return viewSet(s);
   }
   viewHome();
 }
 window.addEventListener('hashchange', route);
+const MODES = { flash: (s) => playFlash(s), write: (s) => playWrite(s), test: (s) => playTest(s), match: (s) => playMatch(s), ai: (s) => playAI(s) };
+let lastFolder = null; // из какой папки пришли — туда ведёт «назад» с экрана набора
 
 /* ---------- home ---------- */
+const setItem = (s) => {
+  const k = knownCount(s);
+  return `<a class="set-item" href="#/set/${s.id}"><div class="set-title">${esc(s.title)}</div><div class="muted small">${cardsWord(s.cards.length)} · выучено ${k}</div>${bar(s.cards.length ? (k / s.cards.length) * 100 : 0)}</a>`;
+};
+const folderItem = (f) => {
+  const d = folderDeck(f), k = knownCount(d), n = f.setIds.filter(getSet).length;
+  return `<a class="set-item folder-item" href="#/folder/${f.id}"><div class="set-title">📁 ${esc(f.title)}</div><div class="muted small">${n} ${plural(n, 'набор', 'набора', 'наборов')} · ${cardsWord(d.cards.length)} · выучено ${k}</div>${bar(d.cards.length ? (k / d.cards.length) * 100 : 0)}</a>`;
+};
+const byUpdated = (a, b) => (b.updated || 0) - (a.updated || 0);
+const byTitle = (a, b) => a.title.localeCompare(b.title, 'ru');
+
 function viewHome() {
-  const list = sets.length
-    ? [...sets].sort((a, b) => (b.updated || 0) - (a.updated || 0)).map((s) => {
-        const k = knownCount(s);
-        return `<a class="set-item" href="#/set/${s.id}"><div class="set-title">${esc(s.title)}</div><div class="muted small">${cardsWord(s.cards.length)} · выучено ${k}</div>${bar(s.cards.length ? (k / s.cards.length) * 100 : 0)}</a>`;
-      }).join('')
-    : `<div class="empty"><div class="big">🗂️</div><p>Пока нет ни одного набора.<br>Создай свой или импортируй из Quizlet.</p></div>`;
+  lastFolder = null;
+  const inFolder = new Set(folders.flatMap((f) => f.setIds));
+  const loose = sets.filter((s) => !inFolder.has(s.id)).sort(byUpdated);
+  const empty = !sets.length && !folders.length;
   const aiNote = settings.apiKey ? '' : `<a class="set-item" href="#/settings" style="background:var(--accent-soft)"><b>✨ Подключи ИИ бесплатно</b><div class="small muted">Вставь ключ Gemini — и приложение будет само придумывать задания и понимать ответы по смыслу.</div></a>`;
   app.innerHTML = layout('Мои наборы', `
-    <div class="row"><a class="btn primary" href="#/new">＋ Новый набор</a><a class="btn" href="#/import">⇩ Из Quizlet</a></div>
-    ${aiNote}${list}`, { actions: `<a class="icon-btn" href="#/settings" aria-label="Настройки">⚙︎</a>` });
+    <div class="row"><a class="btn primary" href="#/new">＋ Набор</a><a class="btn" href="#/newfolder">＋ Папка</a><a class="btn" href="#/import">⇩ Quizlet</a></div>
+    ${aiNote}
+    ${empty ? `<div class="empty"><div class="big">🗂️</div><p>Пока нет ни одного набора.<br>Создай свой или импортируй из Quizlet.</p></div>` : ''}
+    ${folders.length ? `<h2 class="section">Папки</h2>${[...folders].sort(byTitle).map(folderItem).join('')}` : ''}
+    ${loose.length ? `<h2 class="section">${folders.length ? 'Наборы без папки' : 'Наборы'}</h2>${loose.map(setItem).join('')}` : ''}
+    ${folders.length && sets.length ? `<a class="btn wide mt" href="#/all">Все наборы (${sets.length})</a>` : ''}`,
+  { actions: `<a class="icon-btn" href="#/settings" aria-label="Настройки">⚙︎</a>` });
+}
+
+function viewAllSets() {
+  app.innerHTML = layout('Все наборы', [...sets].sort(byTitle).map(setItem).join('') || '<div class="muted">Наборов нет</div>', { back: '#/' });
+}
+
+// Режимы учёбы и выбор направления — общие для набора и папки
+function modesHTML(base, what) {
+  return `<div class="modes">
+      <a class="mode" href="${base}/play/flash"><span class="ico">🃏</span>Карточки<small>Переворачивай и запоминай</small></a>
+      <a class="mode" href="${base}/play/write"><span class="ico">✍️</span>Письмо<small>Пиши ответ сам</small></a>
+      <a class="mode" href="${base}/play/test"><span class="ico">✅</span>Тест<small>Выбери вариант</small></a>
+      <a class="mode" href="${base}/play/match"><span class="ico">🧩</span>Подбор пар<small>На скорость</small></a>
+      <a class="mode ai" href="${base}/play/ai"><span class="ico">✨</span>ИИ-задания<small>Gemini придумает упражнения ${what}</small></a>
+    </div>
+    <div class="field"><span>Что спрашивать</span>
+      <div class="seg">${[['term', 'Термин → значение'], ['def', 'Значение → термин'], ['mix', 'Вперемешку']].map(([v, l]) => `<button data-dir="${v}" class="${settings.direction === v ? 'on' : ''}">${l}</button>`).join('')}</div>
+    </div>`;
+}
+function bindDir() {
+  $$('[data-dir]').forEach((b) => b.onclick = () => {
+    settings.direction = b.dataset.dir; saveSettings();
+    $$('[data-dir]').forEach((x) => x.classList.toggle('on', x === b));
+  });
+}
+
+/* ---------- folder ---------- */
+function viewFolder(f) {
+  lastFolder = f.id;
+  const d = folderDeck(f), k = knownCount(d);
+  const list = f.setIds.map(getSet).filter(Boolean);
+  app.innerHTML = layout('📁 ' + f.title, `
+    <div class="muted small">${list.length} ${plural(list.length, 'набор', 'набора', 'наборов')} · ${cardsWord(d.cards.length)} · выучено ${k}</div>
+    ${bar(d.cards.length ? (k / d.cards.length) * 100 : 0)}
+    ${d.cards.length ? modesHTML(`#/folder/${f.id}`, 'по всем словам папки') : ''}
+    <h2 class="section">Наборы в папке</h2>
+    ${list.map(setItem).join('') || '<div class="muted">В папке пока нет наборов</div>'}
+    <div class="stack mt">
+      <a class="btn" href="#/folder/${f.id}/edit">📁 Выбрать наборы и название</a>
+      <button class="btn" id="reset">↺ Сбросить прогресс по папке</button>
+      <button class="btn bad" id="del">Удалить папку</button>
+    </div>`, { back: '#/' });
+  bindDir();
+  $('#reset').onclick = () => {
+    if (!confirm('Сбросить прогресс по всем наборам папки?')) return;
+    d.cards.forEach((c) => { const x = findCard(c.id); if (x) { x.streak = 0; x.right = 0; x.wrong = 0; } });
+    saveSets(); route();
+  };
+  $('#del').onclick = () => {
+    if (!confirm(`Удалить папку «${f.title}»? Наборы останутся.`)) return;
+    folders = folders.filter((x) => x.id !== f.id); saveSets(); go('#/');
+  };
+}
+
+function viewFolderEdit(existing) {
+  const all = [...sets].sort(byTitle);
+  const ids = new Set(existing?.setIds || []);
+  app.innerHTML = layout(existing ? 'Папка' : 'Новая папка', `
+    <label class="field"><span>Название</span><input id="title" value="${esc(existing?.title || '')}" placeholder="Например: Travel"></label>
+    <h2 class="section">Наборы в папке</h2>
+    <p class="hint">Один набор может лежать в нескольких папках.</p>
+    <div class="panel">${all.map((s) => `<label class="check"><input type="checkbox" data-id="${s.id}" ${ids.has(s.id) ? 'checked' : ''}><span>${esc(s.title)} <small class="muted">· ${s.cards.length}</small></span></label>`).join('') || '<div class="muted">Наборов пока нет</div>'}</div>
+    <div class="sticky-bottom"><button class="btn primary wide" id="save">Сохранить</button></div>`,
+  { back: existing ? `#/folder/${existing.id}` : '#/' });
+  $('#save').onclick = () => {
+    const title = $('#title').value.trim() || 'Без названия';
+    const checked = $$('[data-id]').filter((x) => x.checked).map((x) => x.dataset.id);
+    const old = existing ? existing.setIds.filter((id) => checked.includes(id)) : []; // прежний порядок, новые — в конец
+    const setIds = [...old, ...checked.filter((id) => !old.includes(id))];
+    let f = existing && getFolder(existing.id);
+    if (f) Object.assign(f, { title, setIds });
+    else { f = { id: uid(), title, setIds, created: Date.now() }; folders.push(f); }
+    saveSets(); go(`#/folder/${f.id}`);
+  };
+}
+
+// В какие папки положить набор
+function viewSetFolders(s) {
+  app.innerHTML = layout('Папки набора', `
+    <div class="muted small">${esc(s.title)}</div>
+    <div class="panel mt">${[...folders].sort(byTitle).map((f) => `<label class="check"><input type="checkbox" data-id="${f.id}" ${f.setIds.includes(s.id) ? 'checked' : ''}><span>📁 ${esc(f.title)}</span></label>`).join('') || '<div class="muted">Папок пока нет</div>'}</div>
+    <label class="field mt"><span>Или новая папка</span><input id="newf" placeholder="Название новой папки"></label>
+    <div class="sticky-bottom"><button class="btn primary wide" id="save">Сохранить</button></div>`, { back: `#/set/${s.id}` });
+  $('#save').onclick = () => {
+    for (const box of $$('[data-id]')) {
+      const f = getFolder(box.dataset.id);
+      if (!f) continue;
+      const has = f.setIds.includes(s.id);
+      if (box.checked && !has) f.setIds.push(s.id);
+      if (!box.checked && has) f.setIds = f.setIds.filter((id) => id !== s.id);
+    }
+    const nf = $('#newf').value.trim();
+    if (nf) folders.push({ id: uid(), title: nf, setIds: [s.id], created: Date.now() });
+    saveSets(); go(`#/set/${s.id}`);
+  };
 }
 
 /* ---------- set ---------- */
 function viewSet(s) {
   const k = knownCount(s);
-  const dirBtn = (v, label) => `<button data-dir="${v}" class="${settings.direction === v ? 'on' : ''}">${label}</button>`;
   const rows = s.cards.map((c) => `<div class="card-row"><div>${esc(c.term)}</div><div class="muted">${esc(c.def)}</div><div class="dot ${status(c)}" title="${status(c) === 'known' ? 'выучено' : status(c) === 'learning' ? 'учу' : 'новое'}"></div></div>`).join('');
+  const fs = setFolders(s.id);
+  const back = lastFolder && getFolder(lastFolder)?.setIds.includes(s.id) ? `#/folder/${lastFolder}` : '#/';
   app.innerHTML = layout(s.title, `
     <div class="muted small">${cardsWord(s.cards.length)} · выучено ${k}</div>
     ${bar(s.cards.length ? (k / s.cards.length) * 100 : 0)}
-    <div class="modes">
-      <a class="mode" href="#/set/${s.id}/play/flash"><span class="ico">🃏</span>Карточки<small>Переворачивай и запоминай</small></a>
-      <a class="mode" href="#/set/${s.id}/play/write"><span class="ico">✍️</span>Письмо<small>Пиши ответ сам</small></a>
-      <a class="mode" href="#/set/${s.id}/play/test"><span class="ico">✅</span>Тест<small>Выбери вариант</small></a>
-      <a class="mode" href="#/set/${s.id}/play/match"><span class="ico">🧩</span>Подбор пар<small>На скорость</small></a>
-      <a class="mode ai" href="#/set/${s.id}/play/ai"><span class="ico">✨</span>ИИ-задания<small>Gemini придумает упражнения именно под этот набор</small></a>
-    </div>
-    <div class="field"><span>Что спрашивать</span>
-      <div class="seg">${dirBtn('term', 'Термин → значение')}${dirBtn('def', 'Значение → термин')}${dirBtn('mix', 'Вперемешку')}</div>
-    </div>
+    <a class="folder-line small" href="#/set/${s.id}/folders">📁 ${fs.length ? fs.map((f) => esc(f.title)).join(', ') : 'Положить в папку'}</a>
+    ${modesHTML(`#/set/${s.id}`, 'именно под этот набор')}
     <div class="panel mt">${rows || '<div class="muted">В наборе нет карточек</div>'}</div>
     <div class="stack mt">
       <a class="btn" href="#/set/${s.id}/import">⇩ Добавить карточки из текста</a>
       <button class="btn" id="export">⧉ Скопировать как текст</button>
       <button class="btn" id="reset">↺ Сбросить прогресс</button>
       <button class="btn bad" id="del">Удалить набор</button>
-    </div>`, { back: '#/', actions: `<a class="icon-btn" href="#/set/${s.id}/edit" aria-label="Редактировать">✎</a>` });
-
-  $$('[data-dir]').forEach((b) => b.onclick = () => {
-    settings.direction = b.dataset.dir; saveSettings();
-    $$('[data-dir]').forEach((x) => x.classList.toggle('on', x === b));
-  });
+    </div>`, { back, actions: `<a class="icon-btn" href="#/set/${s.id}/edit" aria-label="Редактировать">✎</a>` });
+  bindDir();
   $('#export').onclick = async () => {
     const text = s.cards.map((c) => `${c.term}\t${c.def}`).join('\n');
     try { await navigator.clipboard.writeText(text); toast('Скопировано'); } catch { prompt('Скопируй текст:', text); }
@@ -552,7 +682,9 @@ function viewSet(s) {
   };
   $('#del').onclick = () => {
     if (!confirm(`Удалить набор «${s.title}»?`)) return;
-    sets = sets.filter((x) => x.id !== s.id); saveSets(); go('#/');
+    sets = sets.filter((x) => x.id !== s.id);
+    for (const f of folders) if (f.setIds.includes(s.id)) f.setIds = f.setIds.filter((id) => id !== s.id);
+    saveSets(); go(back);
   };
 }
 
@@ -626,6 +758,7 @@ function viewImport(target) {
       <div class="small muted">Экспорт обычно доступен только для твоих наборов. Чужой набор сначала скопируй себе в Quizlet. Подойдёт и любой список вида «слово - перевод».</div>
     </details>
     ${target ? '' : `<label class="field"><span>Название набора</span><input id="title" placeholder="Например: Unit 5 — Sport"></label>`}
+    ${target || !folders.length ? '' : `<label class="field"><span>Папка</span><select id="folder"><option value="">Без папки</option>${[...folders].sort(byTitle).map((f) => `<option value="${f.id}" ${f.id === lastFolder ? 'selected' : ''}>${esc(f.title)}</option>`).join('')}</select></label>`}
     <label class="field"><span>Текст</span><textarea id="raw" rows="8" placeholder="dog&#9;собака&#10;cat - кошка"></textarea></label>
     <div class="grid2">
       <label class="field"><span>Термин ↔ значение</span><select id="sepT">
@@ -659,7 +792,10 @@ function viewImport(target) {
       saveSets(); toast(`Добавлено: ${cardsWord(parsed.cards.length)}`); go(`#/set/${target.id}`);
     } else {
       const s = { id: uid(), title: $('#title').value.trim() || 'Импорт из Quizlet', created: Date.now(), updated: Date.now(), cards: parsed.cards };
-      sets.push(s); saveSets(); toast('Набор импортирован'); go(`#/set/${s.id}`);
+      sets.push(s);
+      const f = $('#folder') && getFolder($('#folder').value);
+      if (f) f.setIds.push(s.id);
+      saveSets(); toast('Набор импортирован'); go(`#/set/${s.id}`);
     }
   };
 }
@@ -728,7 +864,7 @@ function viewSettings() {
   if ($('#removeKey')) $('#removeKey').onclick = () => { settings.apiKey = ''; settings.model = ''; settings.models = []; saveSettings(); route(); };
 
   $('#backup').onclick = async () => {
-    const json = JSON.stringify({ app: 'kartochki', version: 1, sets }, null, 2);
+    const json = JSON.stringify({ app: 'kartochki', version: 2, sets, folders }, null, 2);
     const name = `kartochki-${new Date().toISOString().slice(0, 10)}.json`;
     const file = new File([json], name, { type: 'application/json' });
     if (navigator.canShare && navigator.canShare({ files: [file] })) {
@@ -749,14 +885,20 @@ function viewSettings() {
       const data = JSON.parse(await file.text());
       const incoming = Array.isArray(data) ? data : data.sets;
       if (!Array.isArray(incoming)) throw new Error();
-      let added = 0;
+      let added = 0, addedF = 0;
       for (const s of incoming) {
         if (!s || !Array.isArray(s.cards)) continue;
         const i = sets.findIndex((x) => x.id === s.id);
         if (i >= 0) sets[i] = s; else sets.push(s);
         added++;
       }
-      saveSets(); toast(`Восстановлено наборов: ${added}`); go('#/');
+      for (const f of Array.isArray(data.folders) ? data.folders : []) {
+        if (!f || !f.id || !Array.isArray(f.setIds)) continue;
+        const i = folders.findIndex((x) => x.id === f.id);
+        if (i >= 0) folders[i] = f; else folders.push(f);
+        addedF++;
+      }
+      saveSets(); toast(`Восстановлено наборов: ${added}` + (addedF ? `, папок: ${addedF}` : '')); go('#/');
     } catch { toast('Не удалось прочитать файл'); }
   };
 }
@@ -826,14 +968,14 @@ function finishScreen(s, title, big, sub, extra = '', retry) {
     <div class="stack mt">
       ${retry ? `<button class="btn primary" id="retry">${retry.label}</button>` : ''}
       <button class="btn" id="again">Начать заново</button>
-      <a class="btn" href="#/set/${s.id}">К набору</a>
-    </div>`, { back: `#/set/${s.id}` });
+      <a class="btn" href="${home(s)}">${s.isFolder ? 'К папке' : 'К набору'}</a>
+    </div>`, { back: home(s) });
   if (retry) $('#retry').onclick = retry.fn;
   $('#again').onclick = () => route();
 }
 const needCards = (s, n) => {
   if (s.cards.length >= n) return false;
-  app.innerHTML = layout(s.title, `<div class="empty"><div class="big">🃏</div><p>Для этого режима нужно хотя бы ${cardsWord(n)}.</p><a class="btn primary" href="#/set/${s.id}/edit">Добавить карточки</a></div>`, { back: `#/set/${s.id}` });
+  app.innerHTML = layout(s.title, `<div class="empty"><div class="big">🃏</div><p>Для этого режима нужно хотя бы ${cardsWord(n)}.</p><a class="btn primary" href="${s.isFolder ? `#/folder/${s.id}/edit` : `#/set/${s.id}/edit`}">${s.isFolder ? 'Добавить наборы' : 'Добавить карточки'}</a></div>`, { back: home(s) });
   return true;
 };
 
@@ -873,7 +1015,7 @@ function playFlash(s, subset) {
       </div></div>
       <div class="swipe-hint">Нажми, чтобы перевернуть · свайп ← ещё учу, → знаю</div>
       <div class="row"><button class="btn bad" id="no">Ещё учу</button><button class="btn good" id="yes">Знаю</button></div>`,
-    { back: `#/set/${s.id}` });
+    { back: home(s) });
     const card = $('#card');
     card.onclick = (e) => {
       if (e.target.closest('[data-say]')) return;
@@ -918,7 +1060,7 @@ function playWrite(s) {
     } else {
       body += verdictHTML(res, it.a, answer, aiState) + `<button class="btn primary wide mt" id="next">Дальше</button>`;
     }
-    app.innerHTML = layout(s.title, body, { back: `#/set/${s.id}` });
+    app.innerHTML = layout(s.title, body, { back: home(s) });
 
     if (phase === 'ask') {
       const input = $('#ans');
@@ -986,7 +1128,7 @@ function playTest(s) {
       ${bar((i / qs.length) * 100, 'accent')}
       <div class="qcard"><span class="badge">${it.side === 'term' ? 'Выбери значение' : 'Выбери термин'}</span><div class="q">${esc(it.q)}</div></div>
       <div class="options">${it.opts.map((o, k) => `<button class="btn opt" data-k="${k}">${esc(o)}</button>`).join('')}</div>
-      <button class="btn primary wide mt hidden" id="next">Дальше</button>`, { back: `#/set/${s.id}` });
+      <button class="btn primary wide mt hidden" id="next">Дальше</button>`, { back: home(s) });
     let answered = false;
     $$('.opt').forEach((b) => b.onclick = () => {
       if (answered) return;
@@ -1011,7 +1153,7 @@ function playMatch(s) {
   app.innerHTML = layout('Подбор пар', `
     <div class="row" style="justify-content:space-between;align-items:center"><span class="muted small">Найди пары: термин + значение</span><span class="timer" id="timer">0.0 с</span></div>
     <div class="match-grid">${tiles.map((t, k) => `<button class="tile" data-k="${k}">${esc(t.t)}</button>`).join('')}</div>
-    ${s.bestMatch ? `<p class="hint center">Рекорд: ${s.bestMatch.toFixed(1)} с</p>` : ''}`, { back: `#/set/${s.id}` });
+    ${s.bestMatch ? `<p class="hint center">Рекорд: ${s.bestMatch.toFixed(1)} с</p>` : ''}`, { back: home(s) });
   const elapsed = () => (Date.now() - start + penalty) / 1000;
   const timer = setInterval(() => { const el = $('#timer'); if (el) el.textContent = elapsed().toFixed(1) + ' с'; }, 100);
   cleanup = () => clearInterval(timer);
@@ -1028,7 +1170,7 @@ function playMatch(s) {
         clearInterval(timer);
         const time = elapsed();
         const record = !s.bestMatch || time < s.bestMatch;
-        if (record) { s.bestMatch = time; const cur = getSet(s.id); if (cur) cur.bestMatch = time; saveSets(); }
+        if (record) { s.bestMatch = time; const cur = s.isFolder ? getFolder(s.id) : getSet(s.id); if (cur) cur.bestMatch = time; saveSets(); }
         setTimeout(() => finishScreen(s, 'Подбор пар', `${time.toFixed(1)} с`, record ? '🏆 Новый рекорд!' : `Рекорд: ${s.bestMatch.toFixed(1)} с`), 300);
       }
     } else {
@@ -1046,7 +1188,7 @@ function playAI(s) {
   if (!settings.apiKey) {
     app.innerHTML = layout('ИИ-задания', `<div class="empty"><div class="big">✨</div>
       <p>Чтобы ИИ придумывал задания под этот набор, добавь бесплатный ключ Gemini.<br>Это займёт пару минут.</p>
-      <a class="btn primary" href="#/settings">Открыть настройки</a></div>`, { back: `#/set/${s.id}` });
+      <a class="btn primary" href="#/settings">Открыть настройки</a></div>`, { back: home(s) });
     return;
   }
   const typeName = { fill: 'Вставь пропущенное', translate: 'Переведи', choice: 'Выбери ответ' };
@@ -1062,7 +1204,7 @@ function playAI(s) {
         <p class="hint">Предложения с пропусками, перевод фраз и вопросы на понимание. Чаще попадаются слова, которые тебе даются труднее.</p>
         <div class="field"><span>Сколько заданий</span><div class="seg">${[5, 8, 12].map((n) => `<button data-n="${n}" class="${n === count ? 'on' : ''}">${n}</button>`).join('')}</div></div>
         ${error ? `<div class="verdict no small mt">${esc(error)}</div>` : ''}
-        <button class="btn primary wide mt" id="gen">✨ Сгенерировать</button></div>`, { back: `#/set/${s.id}` });
+        <button class="btn primary wide mt" id="gen">✨ Сгенерировать</button></div>`, { back: home(s) });
       $$('[data-n]').forEach((b) => b.onclick = () => { count = +b.dataset.n; draw(); });
       $('#gen').onclick = async () => {
         phase = 'loading'; draw();
@@ -1073,7 +1215,7 @@ function playAI(s) {
       return;
     }
     if (phase === 'loading') {
-      app.innerHTML = layout('ИИ-задания', `<div class="spinner"></div><p class="center muted">Gemini придумывает задания…</p>`, { back: `#/set/${s.id}` });
+      app.innerHTML = layout('ИИ-задания', `<div class="spinner"></div><p class="center muted">Gemini придумывает задания…</p>`, { back: home(s) });
       return;
     }
     if (i >= tasks.length) {
@@ -1098,7 +1240,7 @@ function playAI(s) {
         + (t.explanation ? `<div class="hint">${esc(t.explanation)}</div>` : '')
         + `<button class="btn primary wide mt" id="next">Дальше</button>`;
     }
-    app.innerHTML = layout(`ИИ · ${i + 1} / ${tasks.length}`, body, { back: `#/set/${s.id}` });
+    app.innerHTML = layout(`ИИ · ${i + 1} / ${tasks.length}`, body, { back: home(s) });
 
     const finish = (r) => { res = r; if (r.ok) right++; else missed.push(t); phase = 'result'; draw(); };
     if (phase === 'ask' && t.type === 'choice') {
