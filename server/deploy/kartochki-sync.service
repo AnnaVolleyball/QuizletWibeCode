@@ -1,0 +1,32 @@
+# /etc/systemd/system/kartochki-sync.service — сервер синхронизации Карточек
+[Unit]
+Description=Kartochki sync server
+After=network.target
+
+[Service]
+User=anna
+Group=anna
+WorkingDirectory=/srv/kartochki-sync
+Environment=KARTOCHKI_HOST=127.0.0.1
+Environment=KARTOCHKI_PORT=8788
+Environment=KARTOCHKI_DB=/srv/kartochki-sync/data/sync.db
+# необязательные настройки (KARTOCHKI_NEW_SPACES, KARTOCHKI_MAX_SPACES, KARTOCHKI_ORIGINS) — в этом файле
+EnvironmentFile=-/srv/kartochki-sync/.env
+ExecStart=/usr/bin/python3 -u /srv/kartochki-sync/sync_server.py
+Restart=on-failure
+RestartSec=3
+MemoryMax=128M
+# защита: сервис видит только свою папку с данными
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=/srv/kartochki-sync/data
+
+[Install]
+WantedBy=multi-user.target

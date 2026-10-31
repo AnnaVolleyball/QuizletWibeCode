@@ -1,0 +1,9 @@
+# /etc/systemd/system/kartochki-sync-backup.service — ежедневная копия базы (в ней только шифр)
+[Unit]
+Description=Kartochki sync DB backup
+
+[Service]
+Type=oneshot
+User=anna
+Group=anna
+ExecStart=/bin/sh -c 'mkdir -p /srv/kartochki-sync/data/backups && sqlite3 /srv/kartochki-sync/data/sync.db ".backup /srv/kartochki-sync/data/backups/sync-$(date +%%F).db" && find /srv/kartochki-sync/data/backups -name "sync-*.db" -mtime +14 -delete'

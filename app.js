@@ -25,14 +25,40 @@ const SETS_KEY = 'qv.sets', SETTINGS_KEY = 'qv.settings';
 function load(key, fallback) { try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; } }
 let sets = load(SETS_KEY, null);
 let settings = Object.assign({ apiKey: '', model: '', direction: 'term', models: [] }, load(SETTINGS_KEY, {}));
-const saveSets = () => localStorage.setItem(SETS_KEY, JSON.stringify(sets));
+const DEL_KEY = 'qv.deleted'; // удалённые наборы [{ id, at }] — чтобы удаление дошло до других устройств
+let deleted = load(DEL_KEY, []);
+// Для синхронизации: у каждого набора есть syncAt — когда он менялся. saveSets() сам находит изменённые
+// наборы (сравнивает с прошлым снимком) и ставит им syncAt, а исчезнувшие заносит в deleted.
+const setHash = (s) => { const { syncAt, ...rest } = s; return JSON.stringify(rest); };
+let setHashes = new Map();
+function persistSets() {
+  localStorage.setItem(SETS_KEY, JSON.stringify(sets));
+  localStorage.setItem(DEL_KEY, JSON.stringify(deleted));
+}
+function saveSets() {
+  const t = Date.now(), seen = new Set();
+  for (const s of sets) {
+    seen.add(s.id);
+    const h = setHash(s);
+    if (setHashes.get(s.id) !== h || !s.syncAt) { s.syncAt = t; setHashes.set(s.id, h); }
+  }
+  for (const id of [...setHashes.keys()]) {
+    if (seen.has(id)) continue;
+    setHashes.delete(id);
+    deleted = deleted.filter((d) => d.id !== id);
+    deleted.push({ id, at: t });
+  }
+  deleted = deleted.filter((d) => !seen.has(d.id));
+  persistSets();
+  if (typeof scheduleSync === 'function') scheduleSync();
+}
 const saveSettings = () => localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
 const getSet = (id) => sets.find((s) => s.id === id);
 const newCard = (term = '', def = '') => ({ id: uid(), term, def, streak: 0, right: 0, wrong: 0 });
 
 if (!Array.isArray(sets)) {
   sets = [{
-    id: uid(), title: 'Пример: спорт', created: Date.now(), updated: Date.now(),
+    id: uid(), demo: true, title: 'Пример: спорт', created: Date.now(), updated: Date.now(),
     cards: [
       ['to play ball', '(по)играть в мяч'],
       ['to win', 'выигрывать / выиграть'],
@@ -46,12 +72,241 @@ if (!Array.isArray(sets)) {
   }];
   saveSets();
 }
+for (const s of sets) { if (!s.syncAt) s.syncAt = s.updated || s.created || 1; setHashes.set(s.id, setHash(s)); }
+
+/* ---------- синхронизация через свой сервер ----------
+   Наборы хранятся на устройстве, а на сервер уходит их зашифрованная копия (по образцу «Монетки»).
+   Ключ — 32 символа; из него (HKDF-SHA256) получаются ключ шифрования, ключ для обезличенных
+   идентификаторов, токен входа и номер «пространства». Сервер видит только rid, время и шифр.
+   Одна запись на сервере = один набор целиком (с карточками и прогрессом); удаление пишется в ту же запись.
+   Побеждает более поздняя правка (syncAt). Настройки синхронизации — в localStorage['qv.sync']. */
+const SYNC_CFG_KEY = 'qv.sync';
+const SYNC_DEFAULT_SERVER = 'https://kartochki-sync.lav11.com';
+const B32 = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'; // Crockford: без I, L, O, U
+const SYNC_BATCH = 200;
+const sync = { busy: false, again: false, timer: null, error: '', keys: null, keysFor: '' };
+
+function syncCfg() { try { return JSON.parse(localStorage.getItem(SYNC_CFG_KEY) || 'null'); } catch { return null; } }
+function syncSaveCfg(c) { try { if (c) localStorage.setItem(SYNC_CFG_KEY, JSON.stringify(c)); else localStorage.removeItem(SYNC_CFG_KEY); } catch {} }
+
+const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+const b64 = (buf) => { let s = ''; for (const b of new Uint8Array(buf)) s += String.fromCharCode(b); return btoa(s); };
+const unb64 = (str) => Uint8Array.from(atob(str), (c) => c.charCodeAt(0));
+function b32enc(bytes) {
+  let bits = 0, val = 0, out = '';
+  for (const b of bytes) { val = (val << 8) | b; bits += 8; while (bits >= 5) { out += B32[(val >>> (bits - 5)) & 31]; bits -= 5; } }
+  if (bits) out += B32[(val << (5 - bits)) & 31];
+  return out;
+}
+function b32dec(str) {
+  let bits = 0, val = 0; const out = [];
+  for (const ch of str) { const i = B32.indexOf(ch); if (i < 0) return null; val = ((val << 5) | i) & 0xffff; bits += 5; if (bits >= 8) { out.push((val >>> (bits - 8)) & 255); bits -= 8; } }
+  return new Uint8Array(out);
+}
+// Ключ: 19 случайных байт + 1 байт проверки = 32 символа, группы по 4 через дефис
+async function syncCheckByte(bytes) { return new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))[0]; }
+async function syncNewKey() {
+  const r = crypto.getRandomValues(new Uint8Array(19));
+  const all = new Uint8Array(20); all.set(r); all[19] = await syncCheckByte(r);
+  return b32enc(all).match(/.{4}/g).join('-');
+}
+// Ключ в каноническом виде или null, если в нём опечатка
+async function syncNormKey(input) {
+  const s = String(input || '').toUpperCase().replace(/[OО]/g, '0').replace(/[ILІ]/g, '1').replace(/[^0-9A-Z]/g, '');
+  if (s.length !== 32) return null;
+  const bytes = b32dec(s);
+  if (!bytes || bytes.length !== 20) return null;
+  if (await syncCheckByte(bytes.slice(0, 19)) !== bytes[19]) return null;
+  return s.match(/.{4}/g).join('-');
+}
+function syncNormServer(s) {
+  s = String(s || '').trim().replace(/\/+$/, '');
+  if (s && !/^https?:\/\//i.test(s)) s = 'https://' + s;
+  return s;
+}
+
+async function syncKeys(key) {
+  if (sync.keys && sync.keysFor === key) return sync.keys;
+  const raw = b32dec(key.replace(/-/g, ''));
+  const te = new TextEncoder();
+  const hk = await crypto.subtle.importKey('raw', raw, 'HKDF', false, ['deriveKey', 'deriveBits']);
+  const p = (info) => ({ name: 'HKDF', hash: 'SHA-256', salt: te.encode('kartochki-sync-v1'), info: te.encode(info) });
+  sync.keys = {
+    enc: await crypto.subtle.deriveKey(p('kartochki/enc'), hk, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']),
+    mac: await crypto.subtle.deriveKey(p('kartochki/rid'), hk, { name: 'HMAC', hash: 'SHA-256', length: 256 }, false, ['sign']),
+    token: hex(await crypto.subtle.deriveBits(p('kartochki/auth'), hk, 256)),
+    space: hex(await crypto.subtle.deriveBits(p('kartochki/space'), hk, 128)),
+  };
+  sync.keysFor = key;
+  return sync.keys;
+}
+const syncRid = async (k, id) => hex(await crypto.subtle.sign('HMAC', k.mac, new TextEncoder().encode('set\n' + id))).slice(0, 32);
+async function syncSeal(k, rid, ts, payload) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: new TextEncoder().encode(rid + ':' + ts) }, k.enc, new TextEncoder().encode(JSON.stringify(payload)));
+  return { rid, ts, blob: b64(iv) + '.' + b64(ct) };
+}
+async function syncOpen(k, it) {
+  const [iv, ct] = it.blob.split('.');
+  const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(iv), additionalData: new TextEncoder().encode(it.rid + ':' + it.ts) }, k.enc, unb64(ct));
+  return JSON.parse(new TextDecoder().decode(plain));
+}
+
+// Что изменилось на устройстве после since → зашифрованные записи
+async function syncBuild(k, since) {
+  const out = [];
+  for (const s of sets) if ((s.syncAt || 0) > since) out.push(await syncSeal(k, await syncRid(k, s.id), s.syncAt, { s }));
+  for (const d of deleted) if (d.at > since) out.push(await syncSeal(k, await syncRid(k, d.id), d.at, { d }));
+  return out;
+}
+async function syncUnpack(k, items) {
+  const ch = { sets: [], deleted: [] };
+  for (const it of items) {
+    let p;
+    try { p = await syncOpen(k, it); } catch { console.warn('sync: запись не расшифровалась', it.rid); continue; }
+    if (p.s && p.s.id && Array.isArray(p.s.cards)) ch.sets.push(p.s);
+    else if (p.d && p.d.id) ch.deleted.push(p.d);
+  }
+  return ch;
+}
+// Принять изменения с других устройств: побеждает более позднее
+function applyRemote(ch) {
+  let n = 0;
+  for (const r of ch.sets) {
+    const tomb = deleted.find((d) => d.id === r.id);
+    if (tomb && tomb.at >= (r.syncAt || 0)) continue;
+    const i = sets.findIndex((s) => s.id === r.id);
+    if (i < 0) { if (tomb) deleted = deleted.filter((d) => d !== tomb); sets.push(r); }
+    else if ((r.syncAt || 0) > (sets[i].syncAt || 0)) sets[i] = r;
+    else continue;
+    setHashes.set(r.id, setHash(r)); n++;
+  }
+  for (const d of ch.deleted) {
+    const i = sets.findIndex((s) => s.id === d.id);
+    if (i >= 0 && (sets[i].syncAt || 0) > d.at) continue; // здесь набор правили позже удаления
+    if (i >= 0) { sets.splice(i, 1); setHashes.delete(d.id); n++; }
+    if (!deleted.some((x) => x.id === d.id)) deleted.push(d);
+  }
+  if (n) persistSets();
+  return n;
+}
+
+async function syncPost(cfg, k, body) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 25000);
+  let r;
+  try {
+    r = await fetch(cfg.server + '/sync', { method: 'POST', signal: ctl.signal, cache: 'no-store',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + k.token }, body: JSON.stringify({ space: k.space, ...body }) });
+  } catch { throw new Error('offline'); }
+  finally { clearTimeout(t); }
+  if (r.status === 401) throw new Error('Ключ не подходит к этому серверу');
+  if (r.status === 403) throw new Error('Сервер не принимает новые ключи');
+  if (r.status === 429) throw new Error('Слишком часто, попробуй через минуту');
+  if (!r.ok) throw new Error('Ошибка сервера (' + r.status + ')');
+  return r.json();
+}
+async function syncPullAll(cfg, k) {
+  const items = [];
+  let cursor = 0, more = true;
+  while (more) {
+    const r = await syncPost(cfg, k, { since: cursor, push: [] });
+    if (r.reset) return { items: [], cursor: 0 };
+    items.push(...r.items); cursor = r.cursor; more = r.more;
+  }
+  return { items, cursor };
+}
+const syncErrText = (e) => (e.message === 'offline' ? 'Нет связи с сервером — наборы сохранены на телефоне' : e.message);
+
+// Полный обмен: отправить своё, получить чужое
+async function syncNow(manual) {
+  const cfg = syncCfg();
+  if (!cfg) return;
+  if (sync.busy) { sync.again = true; return; }
+  clearTimeout(sync.timer);
+  sync.busy = true; sync.error = '';
+  syncRefreshUI();
+  let changed = 0;
+  try {
+    const k = await syncKeys(cfg.key);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const at = Date.now();
+      const recs = await syncBuild(k, cfg.pushedAt || 0);
+      let cursor = cfg.cursor || 0, i = 0, more = false, reset = false;
+      const incoming = [];
+      do {
+        const r = await syncPost(cfg, k, { since: cursor, push: recs.slice(i, i + SYNC_BATCH) });
+        if (r.reset) { reset = true; break; }
+        i += SYNC_BATCH; incoming.push(...r.items); cursor = r.cursor; more = r.more;
+      } while (i < recs.length || more);
+      if (reset) { cfg.cursor = 0; cfg.pushedAt = 0; continue; } // сервер начал с чистого листа — отправляем всё заново
+      changed = applyRemote(await syncUnpack(k, incoming));
+      cfg.cursor = cursor; cfg.pushedAt = at - 1; cfg.lastOk = Date.now();
+      break;
+    }
+    syncSaveCfg(cfg);
+    if (manual) toast(changed ? `Готово, обновлено наборов: ${changed}` : 'Синхронизировано');
+  } catch (e) {
+    sync.error = syncErrText(e);
+    if (manual) toast(sync.error);
+  }
+  sync.busy = false;
+  // во время игры экран не перерисовываем, чтобы не сбить упражнение
+  const h = location.hash.replace(/^#\/?/, '');
+  if (changed && (h === '' || /^set\/[^/]+$/.test(h))) route();
+  else syncRefreshUI();
+  if (sync.again) { sync.again = false; scheduleSync(1000); }
+}
+// После каждого сохранения — обмен через несколько секунд (несколько ответов подряд уйдут одним запросом)
+function scheduleSync(ms = 4000) {
+  if (!syncCfg()) return;
+  clearTimeout(sync.timer);
+  sync.timer = setTimeout(() => syncNow(false), ms);
+}
+// Подключить это устройство. key — уже проверенный ключ.
+async function syncConnect(server, key, isNew) {
+  const cfg = { server, key, cursor: 0, pushedAt: 0 };
+  const k = await syncKeys(key);
+  const got = await syncPullAll(cfg, k); // заодно проверяет адрес и ключ
+  if (!isNew && got.items.length) {
+    const own = sets.filter((s) => !(s.demo || (s.title === 'Пример: спорт' && s.cards.length === 8)));
+    const replace = !own.length || confirm('На сервере уже есть наборы.\n\nОК — заменить наборы этого устройства наборами с сервера (рекомендуется).\nОтмена — объединить: на сервер уйдут и наборы этого устройства.');
+    if (replace) {
+      sets = []; deleted = []; setHashes = new Map();
+      applyRemote(await syncUnpack(k, got.items));
+      persistSets();
+      cfg.pushedAt = Date.now(); cfg.cursor = got.cursor;
+    }
+  }
+  syncSaveCfg(cfg);
+  await syncNow(false);
+}
+function syncStatusText() {
+  const cfg = syncCfg();
+  if (!cfg) return 'Выключена';
+  if (sync.busy) return 'Синхронизация…';
+  if (sync.error) return sync.error;
+  if (!cfg.lastOk) return 'Ещё не синхронизировано';
+  const d = new Date(cfg.lastOk), now = new Date();
+  const hm = d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+  return 'Последняя: ' + (d.toDateString() === now.toDateString() ? 'сегодня' : d.toLocaleDateString('ru-RU')) + ' в ' + hm;
+}
+function syncRefreshUI() {
+  const el = document.getElementById('syncStatus');
+  if (el) el.textContent = (sync.busy ? '🔄 ' : sync.error ? '⚠️ ' : syncCfg()?.lastOk ? '✅ ' : '') + syncStatusText();
+  const b = document.getElementById('syncNow');
+  if (b) b.disabled = sync.busy;
+}
+// Когда синхронизировать: при открытии, при возвращении в приложение, при появлении сети и раз в 5 минут
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') scheduleSync(500); });
+window.addEventListener('online', () => scheduleSync(1000));
+setInterval(() => { if (document.visibilityState === 'visible') scheduleSync(0); }, 5 * 60 * 1000);
 
 const status = (c) => ((c.streak || 0) >= 2 ? 'known' : (c.right || c.wrong) ? 'learning' : 'new');
 const knownCount = (s) => s.cards.filter((c) => status(c) === 'known').length;
 
 function mark(set, card, ok) {
-  const c = set.cards.find((x) => x.id === card.id);
+  const c = (getSet(set.id) || set).cards.find((x) => x.id === card.id);
   if (!c) return;
   c.prevStreak = c.streak || 0;
   if (ok) { c.right = (c.right || 0) + 1; c.streak = (c.streak || 0) + 1; }
@@ -59,7 +314,7 @@ function mark(set, card, ok) {
   saveSets();
 }
 function unmarkWrong(set, card) {
-  const c = set.cards.find((x) => x.id === card.id);
+  const c = (getSet(set.id) || set).cards.find((x) => x.id === card.id);
   if (!c) return;
   c.wrong = Math.max(0, (c.wrong || 0) - 1);
   c.right = (c.right || 0) + 1;
@@ -292,7 +547,7 @@ function viewSet(s) {
   };
   $('#reset').onclick = () => {
     if (!confirm('Сбросить прогресс по этому набору?')) return;
-    s.cards.forEach((c) => { c.streak = 0; c.right = 0; c.wrong = 0; });
+    (getSet(s.id) || s).cards.forEach((c) => { c.streak = 0; c.right = 0; c.wrong = 0; });
     saveSets(); route();
   };
   $('#del').onclick = () => {
@@ -327,7 +582,8 @@ function viewEdit(existing) {
       if (!draft.cards.length) return toast('Добавь хотя бы одну карточку');
       draft.title = draft.title.trim() || 'Без названия';
       draft.updated = Date.now();
-      if (existing) Object.assign(existing, draft); else sets.push(draft);
+      const cur = getSet(draft.id);
+      if (cur) Object.assign(cur, draft); else sets.push(draft);
       saveSets(); go(`#/set/${draft.id}`);
     };
   };
@@ -398,6 +654,7 @@ function viewImport(target) {
   $('#save').onclick = () => {
     if (!parsed.cards.length) return;
     if (target) {
+      target = getSet(target.id) || target;
       target.cards.push(...parsed.cards); target.updated = Date.now();
       saveSets(); toast(`Добавлено: ${cardsWord(parsed.cards.length)}`); go(`#/set/${target.id}`);
     } else {
@@ -428,9 +685,10 @@ function viewSettings() {
       <p class="hint">Ключ хранится только в этом браузере на твоём телефоне и отправляется только в Google. На бесплатном тарифе есть лимит запросов в день, а Google может использовать запросы для улучшения своих моделей — не пиши в карточки ничего личного.</p>
       ${settings.apiKey ? '<button class="link" id="removeKey">Удалить ключ</button>' : ''}
     </div>
+    <div class="panel mt" id="syncPanel">${syncPanelHTML()}</div>
     <div class="panel mt">
       <b>💾 Резервная копия</b>
-      <p class="hint">Все наборы хранятся только на этом устройстве. Если очистить данные браузера, они пропадут — время от времени сохраняй копию.</p>
+      <p class="hint">${syncCfg() ? 'Наборы хранятся на устройстве, а зашифрованная копия — на твоём сервере. Файл-копия пригодится на всякий случай.' : 'Все наборы хранятся только на этом устройстве. Если очистить данные браузера, они пропадут — время от времени сохраняй копию или включи синхронизацию.'}</p>
       <div class="stack"><button class="btn" id="backup">Скачать копию (файл)</button>
       <label class="btn">Восстановить из файла<input type="file" id="restore" accept=".json,application/json" class="hidden"></label></div>
     </div>
@@ -445,6 +703,7 @@ function viewSettings() {
     </div>`,
   { back: '#/' });
 
+  bindSyncPanel();
   const st = $('#keyStatus');
   $('#showKey').onclick = () => { const k = $('#key'); k.type = k.type === 'password' ? 'text' : 'password'; };
   $('#saveKey').onclick = async () => {
@@ -499,6 +758,63 @@ function viewSettings() {
       }
       saveSets(); toast(`Восстановлено наборов: ${added}`); go('#/');
     } catch { toast('Не удалось прочитать файл'); }
+  };
+}
+
+/* ---------- экран синхронизации (в настройках) ---------- */
+const syncForm = { server: SYNC_DEFAULT_SERVER, key: '', created: false, show: false, busy: false };
+function syncPanelHTML() {
+  const cfg = syncCfg();
+  if (cfg) return `<b>☁️ Синхронизация</b>
+    <div id="syncStatus" class="small mt">${esc((sync.busy ? '🔄 ' : sync.error ? '⚠️ ' : cfg.lastOk ? '✅ ' : '') + syncStatusText())}</div>
+    <div class="small muted mt">Сервер: ${esc(cfg.server)}</div>
+    ${syncForm.show ? `<div class="sync-key">${esc(cfg.key)}</div>` : ''}
+    <div class="row mt"><button class="btn" id="syncShow">${syncForm.show ? 'Скрыть ключ' : 'Показать ключ'}</button><button class="btn" id="syncCopy">Скопировать ключ</button></div>
+    <button class="btn primary wide mt" id="syncNow" ${sync.busy ? 'disabled' : ''}>🔄 Синхронизировать сейчас</button>
+    <p class="hint">Чтобы подключить другое устройство или новый адрес приложения: открой там Настройки → Синхронизация и введи этот ключ. Без ключа наборы на сервере прочитать невозможно — храни его в «Паролях».</p>
+    <button class="link" id="syncOff">Отключить на этом устройстве</button>`;
+  const f = syncForm;
+  return `<b>☁️ Синхронизация с сервером</b>
+    <p class="hint">Наборы и прогресс сохраняются в <b>зашифрованном</b> виде на твоём сервере и появляются на всех устройствах с тем же ключом. Расшифровать их можно только этим ключом.</p>
+    <form id="syncForm" autocomplete="on">
+      <label class="field"><span>Сервер</span><input id="syncServer" name="username" autocomplete="username" inputmode="url" autocapitalize="off" spellcheck="false" value="${esc(f.server)}"></label>
+      <label class="field"><span>Ключ</span><input id="syncKey" type="password" name="password" autocomplete="${f.created ? 'new-password' : 'current-password'}" autocapitalize="characters" spellcheck="false" placeholder="XXXX-XXXX-…" value="${esc(f.key)}" style="font-family:ui-monospace,monospace"></label>
+      ${f.created ? `<div class="sync-key">${esc(f.key)}</div><div class="verdict ai small">🔑 Это новый ключ. <b>Сохрани его</b>: после «Подключить» iPhone предложит сохранить его в «Пароли». Без ключа копию на сервере не открыть.</div>` : ''}
+      <button class="btn primary wide mt" ${f.busy ? 'disabled' : ''}>${f.busy ? 'Подключаю…' : 'Подключить'}</button>
+    </form>
+    ${f.created ? '' : `<p class="hint">Первое устройство? Создай ключ. Уже есть ключ с другого устройства — введи его выше.</p>
+    <button class="btn wide" id="syncCreate">🔑 Создать новый ключ</button>`}`;
+}
+function bindSyncPanel() {
+  const panel = $('#syncPanel');
+  const redraw = () => { panel.innerHTML = syncPanelHTML(); bindSyncPanel(); };
+  const on = (id, fn) => { const el = $('#' + id); if (el) el.onclick = fn; };
+  on('syncShow', () => { syncForm.show = !syncForm.show; redraw(); });
+  on('syncCopy', async () => { try { await navigator.clipboard.writeText(syncCfg().key); toast('Ключ скопирован'); } catch { prompt('Скопируй ключ:', syncCfg().key); } });
+  on('syncNow', () => syncNow(true));
+  on('syncOff', () => {
+    if (!confirm('Отключить синхронизацию на этом устройстве? Наборы на устройстве и на сервере останутся.')) return;
+    syncSaveCfg(null); sync.error = ''; syncForm.show = false; redraw(); toast('Синхронизация отключена');
+  });
+  on('syncCreate', async () => { syncForm.key = await syncNewKey(); syncForm.created = true; redraw(); });
+  const form = $('#syncForm');
+  if (!form) return;
+  $('#syncServer').oninput = (e) => { syncForm.server = e.target.value; };
+  $('#syncKey').oninput = (e) => { syncForm.key = e.target.value; };
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const server = syncNormServer(syncForm.server);
+    if (!/^https:\/\/[^/]+|^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?/.test(server)) return toast('Введи адрес сервера (https://…)');
+    const key = await syncNormKey(syncForm.key);
+    if (!key) return toast('В ключе ошибка — проверь его');
+    syncForm.busy = true; redraw();
+    try {
+      await syncConnect(server, key, syncForm.created);
+      Object.assign(syncForm, { server: SYNC_DEFAULT_SERVER, key: '', created: false, show: false });
+      toast('Синхронизация включена');
+    } catch (err) { toast(syncErrText(err)); }
+    syncForm.busy = false;
+    if ($('#syncPanel')) redraw();
   };
 }
 
@@ -712,7 +1028,7 @@ function playMatch(s) {
         clearInterval(timer);
         const time = elapsed();
         const record = !s.bestMatch || time < s.bestMatch;
-        if (record) { s.bestMatch = time; saveSets(); }
+        if (record) { s.bestMatch = time; const cur = getSet(s.id); if (cur) cur.bestMatch = time; saveSets(); }
         setTimeout(() => finishScreen(s, 'Подбор пар', `${time.toFixed(1)} с`, record ? '🏆 Новый рекорд!' : `Рекорд: ${s.bestMatch.toFixed(1)} с`), 300);
       }
     } else {
@@ -812,6 +1128,7 @@ function playAI(s) {
 
 /* ---------- start ---------- */
 route();
+scheduleSync(300);
 if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
 if ('serviceWorker' in navigator && location.protocol === 'https:') {
   navigator.serviceWorker.register('sw.js').catch(() => {});

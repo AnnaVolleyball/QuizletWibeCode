@@ -1,0 +1,10 @@
+# /etc/systemd/system/kartochki-sync-backup.timer
+[Unit]
+Description=Daily Kartochki sync DB backup
+
+[Timer]
+OnCalendar=*-*-* 04:17:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

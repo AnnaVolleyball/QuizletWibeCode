@@ -210,3 +210,4 @@ details.howto ol { margin: 8px 0 0; padding-left: 20px; }
   font-size: 14px; opacity: 0; pointer-events: none; transition: .25s; max-width: calc(100% - 32px); z-index: 20;
 }
 #toast.show { opacity: 1; transform: translateX(-50%); }
+.sync-key { font-family: ui-monospace, Menlo, monospace; font-size: 17px; letter-spacing: 1px; text-align: center; padding: 12px; margin-top: 10px; border-radius: 12px; background: var(--accent-soft); word-break: break-all; user-select: all; -webkit-user-select: all; }
